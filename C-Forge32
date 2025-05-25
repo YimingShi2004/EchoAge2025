@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Parallel preprocessing of UK Biobank carotid ultrasound data: convert ZIP archives to NPY arrays.
+
+Workflow:
+1. Read QC metadata and exclude samples with QC == 2 (fail).
+2. Build a task list containing each eligible .zip archive (unique filename stem is preserved).
+3. Parallel worker:
+   3.1 Extract the single .mat file inside the archive.
+   3.2 Load the 3-D array `CI_F` (supports both MATLAB v4–v7.2 and v7.3).
+   3.3 Min–max normalise each volume; temporally down-/up-sample to `TARGET_FRAMES`.
+   3.4 Save as a local .npy file.
+   3.5 Upload to DNAnexus project folder.
+4. Execute the tasks with a process pool.
+5. Write a CSV log and upload it as well.
+
+The script is intended to be executed inside a DNAnexus app or worker node.
+All filenames are preserved so that downstream jobs can map outputs 1-to-1.
+"""
+
+import os
+import zipfile
+import shutil
+import tempfile
+import subprocess
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+try:  # v4-v7.2 .mat support
+    from scipy.io import loadmat
+except ImportError:
+    loadmat = None
+
+import h5py  # v7.3 .mat support
+
+# ---------- Configurable parameters ----------
+BASE_DIR      = "/mnt/project/Bulk/Carotid Ultrasound/Carotid Artery Ultrasound (MAT format)"
+TEMP_DIR      = "/home/dnanexus/preprocessed_tmp"
+META_CSV      = "IMT_model.csv"            # local metadata file
+QC_COL        = "p22684_i0"                # 2 = fail; 1 or NaN = keep
+TARGET_FRAMES = 32                         # temporal dimension after resampling
+DX_DEST       = "/mnt/project/preprocessed_npy"
+MAX_WORKERS   = 72                         # number of parallel processes
+# --------------------------------------------
+
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# ---------- 1. Load QC table ----------
+meta = pd.read_csv(META_CSV, dtype={"eid": str})
+if QC_COL not in meta.columns:
+    raise KeyError(f"Column {QC_COL} not found in metadata")
+valid_eids = set(meta.loc[meta[QC_COL] != 2, "eid"].astype(str))
+print(f"Usable samples (QC != 2): {len(valid_eids)}")
+
+# ---------- 2. Build task list ----------
+TASK_SUBFOLDERS = list(map(str, range(10, 60)))  # sub-folder names "10"-"59"
+
+tasks = []
+for sub in TASK_SUBFOLDERS:
+    folder = os.path.join(BASE_DIR, sub)
+    if not os.path.isdir(folder):
+        continue
+    for fn in os.listdir(folder):
+        if fn.lower().endswith(".zip"):
+            eid = fn.split("_")[0]
+            if eid in valid_eids:
+                zip_path = os.path.join(folder, fn)
+                stem     = os.path.splitext(fn)[0]  # filename stem without .zip
+                tasks.append((zip_path, stem))
+print(f"ZIP archives to process: {len(tasks)}\n")
+
+# ---------- 3. Worker ----------
+
+def worker(task):
+    """Process a single .zip archive -> .npy, return (stem, status, reason)."""
+    zip_path, stem = task
+    tmp_dir = None
+
+    try:
+        # 3.1 Extract the single .mat file
+        with zipfile.ZipFile(zip_path) as zf:
+            mats = [n for n in zf.namelist() if n.lower().endswith(".mat")]
+            if len(mats) != 1:
+                return stem, "skip", "mat_count≠1"
+            tmp_dir = tempfile.mkdtemp(dir=TEMP_DIR)
+            zf.extract(mats[0], path=tmp_dir)
+            mat_path = os.path.join(tmp_dir, mats[0])
+
+        # 3.2 Load CI_F
+        ci = None
+        if loadmat is not None:
+            try:
+                ci = loadmat(mat_path, variable_names=["CI_F"]).get("CI_F")
+            except Exception:
+                ci = None
+        if ci is None:
+            try:
+                with h5py.File(mat_path, "r") as f:
+                    ci = np.array(f["CI_F"])
+            except Exception:
+                ci = None
+        if ci is None or ci.ndim != 3 or ci.shape[0] < TARGET_FRAMES:
+            return stem, "skip", "CI_F_invalid"
+
+        # 3.3 Normalise and temporal sample
+        ci = ci.astype(np.float32)
+        vmin, vmax = ci.min(), ci.max()
+        if vmax <= vmin:
+            return stem, "skip", "flat_volume"
+        ci = (ci - vmin) / (vmax - vmin)
+        if ci.shape[0] > TARGET_FRAMES:
+            idx = np.linspace(0, ci.shape[0] - 1, TARGET_FRAMES, dtype=int)
+            ci = ci[np.unique(idx)]
+
+        # 3.4 Save local NPY
+        npy_local = os.path.join(TEMP_DIR, f"{stem}.npy")
+        np.save(npy_local, ci)
+
+        # 3.5 Upload to DNAnexus
+        subprocess.run(["dx", "mkdir", "-p", DX_DEST],
+                       check=False, stdout=subprocess.DEVNULL)
+        up = subprocess.run(
+            ["dx", "upload", npy_local, "--destination", DX_DEST, "--brief"],
+            capture_output=True, text=True
+        )
+        os.remove(npy_local)
+        if up.returncode != 0:
+            return stem, "skip", "upload_failed"
+
+        return stem, "ok", ""
+
+    except Exception as e:
+        return stem, "skip", f"exception:{e}"
+
+    finally:
+        if tmp_dir and os.path.isdir(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+# ---------- 4. Parallel execution ----------
+results = []
+with ProcessPoolExecutor(max_workers=MAX_WORKERS) as pool:
+    futures = [pool.submit(worker, t) for t in tasks]
+    for f in tqdm(as_completed(futures), total=len(futures), desc="Processing"):
+        results.append(f.result())
+
+# ---------- 5. Write log & upload ----------
+log_df  = pd.DataFrame(results, columns=["file_stem", "status", "reason"])
+log_csv = os.path.join(TEMP_DIR, "preprocessing_log.csv")
+log_df.to_csv(log_csv, index=False, encoding="utf-8-sig")
+subprocess.run(["dx", "upload", log_csv, "--destination", DX_DEST], check=False)
+os.remove(log_csv)
+
+print(f"\n✅ Completed! Success: {sum(log_df.status=='ok')}   "
+      f"Skipped: {sum(log_df.status=='skip')}")
+print("All .npy files and the log have been uploaded to:", DX_DEST)
+
